@@ -124,6 +124,12 @@ options:
     default: false
     choices: [True, False]
     aliases: []
+  guestinfo:
+    description:
+      - A dictionary of keys and values to add as guest info when cloning or reconfiguring a system
+    required: false
+    default: null
+    aliases: []
 '''
 
 EXAMPLES='''
@@ -223,6 +229,7 @@ def main():
                 choices=['linux', 'windows']),
             resource_pool=dict(required=False, default=None, type='str'),
             admin_pass=dict(required=False, default=None, type='str'),
+            guestinfo=dict(required=False, default={}, type='dict')
         ),
         supports_check_mode=False
     )
@@ -261,6 +268,7 @@ def main():
     memory_mb = module.params['memory_mb']
     admin_pass = module.params['admin_pass']
     vm_uuid = module.params['vm_uuid']
+    guestinfo = module.params['guestinfo']
 
     # set up connection
     try:
@@ -269,8 +277,25 @@ def main():
             user=username,
             pwd=password,
             port=int(443))
-    except:
-        module.fail_json(msg='failed to connect to vCenter server')
+    except Exception, e:
+        if isinstance(e, vim.fault.HostConnectFault) and '[SSL: CERTIFICATE_VERIFY_FAILED]' in e.msg:
+            try:
+                import ssl
+                default_context = ssl._create_default_https_context
+                ssl._create_default_https_context = ssl._create_unverified_context
+                si = SmartConnect(
+                    host=vcenter_hostname,
+                    user=username,
+                    pwd=password,
+                    port=int(443)
+                )
+                ssl._create_default_https_context = default_context
+            except Exception as exc1:
+                module.fail_json(msg='failed to connect to vCenter server: ' + str(e))
+                raise Exception(exc1)
+        else:
+            module.fail_json(msg='failed to connect to vCenter server: ' + str(e))
+            raise Exception(exc)
 
     content = si.RetrieveContent()
 
@@ -305,7 +330,7 @@ def main():
             num_cpus, memory_mb, vm_disk,
             vm_folder, vnics, resource_pool,
             vm_uuid, resource_pools, os_family,
-            admin_pass, full_name, org_name)
+            admin_pass, full_name, org_name, guestinfo)
     elif action == 'delete':
         vm = find_vm(module, vm_name, vm_uuid, si)
         delete_vm(module, vm, vm_name)
@@ -639,7 +664,7 @@ def clone_vm(
         suffix_list, datacenter_name, cluster_name,
         datastores, domain_name, num_cpus, memory_mb,
         vm_disk, vm_folder, vnics, resource_pool, vm_uuid,
-        resource_pools, os_family, admin_pass, full_name, org_name):
+        resource_pools, os_family, admin_pass, full_name, org_name, guestinfo):
     """
     Clones a VM from another VM or template
     does guest customizations on said VM
@@ -746,9 +771,12 @@ def clone_vm(
         # network guest_map
         guest_map = vim.vm.customization.AdapterMapping()
         guest_map.adapter = vim.vm.customization.IPSettings()
-        guest_map.adapter.ip = vim.vm.customization.FixedIp()
-        guest_map.adapter.ip.ipAddress = str(ip)
-        guest_map.adapter.subnetMask = str(netmask)
+        if str(ip) == "dhcp":
+            guest_map.adapter.ip = vim.vm.customization.DhcpIpGenerator()
+        else:
+            guest_map.adapter.ip = vim.vm.customization.FixedIp()
+            guest_map.adapter.ip.ipAddress = str(ip)
+            guest_map.adapter.subnetMask = str(netmask)
         # perhaps try statements here?
         if ipv6_addr:
             guest_map.adapter.ipV6Spec = \
@@ -773,6 +801,13 @@ def clone_vm(
     vmconf.annotation = vm_uuid
     vmconf.memoryHotAddEnabled = False
     vmconf.deviceChange = devices
+    vmconf.extraConfig = []
+    if guestinfo:
+        for k in guestinfo.keys():
+            vmconf_options = vim.option.OptionValue()
+            vmconf_options.key = "guestinfo.%s" % str(k)
+            vmconf_options.value = str(guestinfo[k])
+            vmconf.extraConfig.append(vmconf_options)
     if vm_uuid:
         vmconf.uuid = vm_uuid
 
@@ -961,7 +996,7 @@ def wait_for_task(module, task):
 
         if task.info.state == 'error':
             module.fail_json(
-                msg="an error occurred while waiting for task to complete")
+                msg="an error occurred while waiting for task to complete: " + str(task.info))
 
 
 def delete_vm(module, vm, vm_name):
